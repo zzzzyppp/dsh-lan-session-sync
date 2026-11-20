@@ -256,21 +256,25 @@ class LanSessionSync {
   }
 
   listPeers() {
-    const discovered = this.peerTable.list().map((peer) => ({
-      deviceId: peer.deviceId,
-      name: peer.name,
-      address: peer.address,
-      port: peer.port,
-      manual: false,
-    }));
-    const seen = new Set(discovered.map((peer) => `${peer.address}:${peer.port}`));
+    // Manual peers come first: a user-configured address (for example a
+    // Thunderbolt/USB link-local cable peer) is usually more reliable than a
+    // UDP-discovered address, and syncing it first lets the engine skip other
+    // addresses for the same device.
+    const peers = [];
+    const seen = new Set();
     for (const entry of this.manualPeers) {
       const key = `${entry.address}:${entry.port}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      discovered.push({ deviceId: null, name: entry.address, address: entry.address, port: entry.port, manual: true });
+      peers.push({ deviceId: null, name: entry.address, address: entry.address, port: entry.port, manual: true });
     }
-    return discovered;
+    for (const peer of this.peerTable.list()) {
+      const key = `${peer.address}:${peer.port}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      peers.push({ deviceId: peer.deviceId, name: peer.name, address: peer.address, port: peer.port, manual: false });
+    }
+    return peers;
   }
 
   async fetchCatalog(peer) {

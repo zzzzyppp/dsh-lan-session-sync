@@ -131,3 +131,26 @@ test('engine never imports from a peer that identifies as this device', async ()
   assert.equal(report.peers[0].skipped, 2);
   assert.deepEqual(report.skipped, [{ reason: 'self', deviceId: 'device-a', sessionId: null }]);
 });
+
+test('engine skips later addresses for a device already synced in the same run', async () => {
+  const peers = [
+    { deviceId: 'device-b', address: '169.254.89.199', port: 47830, name: 'MacBook B' },
+    { deviceId: 'device-b', address: '192.168.3.168', port: 47830, name: 'MacBook B' },
+  ];
+  let catalogs = 0;
+  const engine = engineFor({
+    peers,
+    fetchCatalog: async () => {
+      catalogs += 1;
+      return { peer: { deviceId: 'device-b', name: 'MacBook B' }, items: [{ id: 'session-new' }] };
+    },
+  });
+  const report = await engine.syncNow();
+  assert.equal(catalogs, 1);
+  assert.equal(report.peers.length, 2);
+  assert.equal(report.peers[0].ok, true);
+  assert.equal(report.peers[0].imported, 1);
+  assert.equal(report.peers[1].ok, true);
+  assert.equal(report.peers[1].items, 0);
+  assert.ok(report.skipped.some((entry) => entry.reason === 'duplicate-peer' && entry.deviceId === 'device-b'));
+});
