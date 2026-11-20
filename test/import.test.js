@@ -287,3 +287,67 @@ test('importSession still imports when a same-id local session has a different c
   assert.equal(result.imported, true);
   assert.equal(result.localId, localSessionIdForDigest(contentDigest(EVENTS)));
 });
+
+test('importSession rewrites delivery markers to the imported session id', async () => {
+  const events = [
+    { seq: 0, type: 'user/message', data: { text: 'hi' } },
+    {
+      seq: 1,
+      type: 'session-log-deepseek/delivery-accepted',
+      data: { sessionId: 'session-remote', sessionFormatVersion: 4, throughSeq: 0 },
+    },
+  ];
+  const { calls, persistence, sessions, workspaceRegistry } = fakes();
+  const cwd = await landing();
+  const result = await importSession({
+    ...baseOptions({ persistence, sessions, workspaceRegistry, landingDir: cwd, now: 999 }),
+    events,
+    digest: contentDigest(events),
+  });
+
+  assert.equal(result.imported, true);
+  const appended = calls.appended[0];
+  assert.equal(appended.length, 2);
+  assert.deepEqual(appended[0], events[0]);
+  assert.equal(appended[1].data.sessionId, result.localId);
+  assert.equal(appended[1].data.sessionFormatVersion, 4);
+  assert.equal(appended[1].data.throughSeq, 0);
+  assert.equal(calls.prepared[0].options.seed[1].data.sessionId, result.localId);
+});
+
+function enoent() {
+  const error = new Error('missing');
+  error.code = 'ENOENT';
+  return error;
+}
+
+test('importSession imports when a same-id local log is not attached to any workspace', async () => {
+  const { calls, persistence, sessions, workspaceRegistry } = fakes();
+  persistence.stat = async (id) => {
+    if (id === 'session-remote') return { header: { id: 'session-remote', createdAt: 1234 } };
+    throw enoent();
+  };
+  workspaceRegistry.list = async () => [];
+  const cwd = await landing();
+  const result = await importSession({
+    ...baseOptions({ persistence, sessions, workspaceRegistry, landingDir: cwd, now: 999 }),
+  });
+  assert.equal(result.imported, true);
+  assert.equal(calls.created.length, 1);
+});
+
+test('importSession aliases a same-id local log that is already visible', async () => {
+  const { calls, persistence, sessions, workspaceRegistry } = fakes();
+  persistence.stat = async (id) => {
+    if (id === 'session-remote') return { header: { id: 'session-remote', createdAt: 1234 } };
+    throw enoent();
+  };
+  workspaceRegistry.list = async () => [{ sessionIds: ['session-remote'] }];
+  const cwd = await landing();
+  const result = await importSession({
+    ...baseOptions({ persistence, sessions, workspaceRegistry, landingDir: cwd, now: 999 }),
+  });
+  assert.equal(result.imported, false);
+  assert.equal(result.reason, 'already-local');
+  assert.equal(calls.created.length, 0);
+});
