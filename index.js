@@ -247,7 +247,8 @@ class LanSessionSync {
     try {
       const { events } = await handle.read();
       if (!Array.isArray(events) || events.length === 0) return null;
-      if (Buffer.byteLength(JSON.stringify(events)) > MAX_SESSION_BYTES) return null;
+      const sizeBytes = Buffer.byteLength(JSON.stringify(events));
+      if (sizeBytes > MAX_SESSION_BYTES) return { tooLarge: true, sizeBytes };
       return { header: snapshot.header, events, digest: contentDigest(events) };
     } finally {
       await Promise.resolve(handle.close()).catch(() => {});

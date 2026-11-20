@@ -40,6 +40,16 @@ test('filterSnapshot accepts a snapshot without eventCount (list/stat omit it)',
   assert.equal(result.item.id, 'session-a');
 });
 
+test('filterSnapshot keeps sessions whose compressed log exceeds the old 32 MiB ceiling', () => {
+  // Regression: a 15 MB zstd log expands to ~53 MB of event JSON. The catalog
+  // only sees the compressed size, so the export ceiling must not be mirrored
+  // back into a 32 MiB admission check that hides the session from peers.
+  const result = filterSnapshot(snapshot({ eventCount: undefined, sizeBytes: 40 * 1024 * 1024 }));
+  assert.equal(result.ok, true);
+  assert.equal(result.item.sizeBytes, 40 * 1024 * 1024);
+  assert.ok(MAX_SESSION_BYTES >= 128 * 1024 * 1024);
+});
+
 test('filterSnapshot refuses sessions that cannot be replayed locally', () => {
   const cases = [
     [snapshot({ header: { ...snapshot().header, id: undefined } }), 'no-id'],

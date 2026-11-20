@@ -240,3 +240,50 @@ test('importSession reports attach failures without failing the import', async (
   assert.equal(result.attached, false);
   assert.match(result.attachError, /workspace busy/);
 });
+
+test('importSession treats a peer copy of a local session as already-local', async () => {
+  const created = [];
+  const persistence = {
+    async stat(id) {
+      if (id === 'session-remote') return { header: { id: 'session-remote', createdAt: 1234 } };
+      const error = new Error('missing');
+      error.code = 'ENOENT';
+      throw error;
+    },
+    async create(header) {
+      created.push(header);
+      throw new Error('must not create');
+    },
+  };
+  const options = baseOptions({ persistence, landingDir: await landing(), now: 77 });
+  const result = await importSession(options);
+
+  assert.equal(result.imported, false);
+  assert.equal(result.reason, 'already-local');
+  assert.equal(result.localId, 'session-remote');
+  assert.equal(created.length, 0);
+  const key = originKey('device-b', 'session-remote');
+  assert.equal(hasImport(options.state, key), true);
+  assert.equal(options.state.imports[key].alias, true);
+  assert.equal(options.state.imports[key].localId, 'session-remote');
+});
+
+test('importSession still imports when a same-id local session has a different creation time', async () => {
+  const { persistence, sessions, workspaceRegistry } = fakes();
+  const originalStat = persistence.stat;
+  persistence.stat = async (id) => {
+    if (id === 'session-remote') return { header: { id: 'session-remote', createdAt: 999 } };
+    return originalStat(id);
+  };
+  const options = baseOptions({
+    persistence,
+    sessions,
+    workspaceRegistry,
+    landingDir: await landing(),
+    now: 78,
+  });
+  const result = await importSession(options);
+
+  assert.equal(result.imported, true);
+  assert.equal(result.localId, localSessionIdForDigest(contentDigest(EVENTS)));
+});

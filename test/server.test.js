@@ -159,3 +159,20 @@ test('requestJson refuses public peer addresses', async () => {
     return error instanceof TransferError && error.code === 'peer-not-private';
   });
 });
+
+test('peer server reports an oversized export as 413 instead of a phantom 404', async (t) => {
+  const { server } = makeServer({
+    exportSession: async () => ({ tooLarge: true, sizeBytes: 4096 }),
+  });
+  const port = await server.start(0);
+  t.after(() => server.close());
+
+  const response = await fetch(`http://127.0.0.1:${port}/v1/sessions/session-a`, {
+    headers: { [MAGIC_HEADER]: '1' },
+  });
+  assert.equal(response.status, 413);
+  assert.deepEqual(await response.json(), { ok: false, error: 'session-too-large', sizeBytes: 4096 });
+  await assert.rejects(fetchPeerSession(peer(port), 'session-a'), (error) => {
+    return error instanceof TransferError && error.code === 'session-too-large';
+  });
+});
