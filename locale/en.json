@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "LAN session sync",
+    "description": "Syncs sessions between DeepSeek Harness machines on the same local network. Each machine keeps its own sessions and only imports sessions it does not already have; imports are verified and attached to a workspace. Session content is sent directly to peers over plain HTTP, so traffic is not encrypted and any LAN host can read sessions unless you set a shared key."
+  }
+}

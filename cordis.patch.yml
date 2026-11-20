@@ -1,0 +1,4 @@
+- insert:
+    - id: lan-session-sync
+      name: dsh-lan-session-sync
+      config: {}
