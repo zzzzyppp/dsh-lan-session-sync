@@ -62,6 +62,15 @@ window.__ModuleLoader__.load({
       skipped: 'skipped',
       confirmClear: 'Remove the shared key? Peers using it will be rejected.',
       confirmGenerate: 'Replace the current shared key? The other device will stop syncing until you set the new key there.',
+      scope: 'Sync scope',
+      scopeHint: 'Files are merged with the same rules on every device: session logs append by zstd frame prefix, workspace/profile/credentials merge structurally, other files stay conflict-safe.',
+      setWorkspace: 'Workspace index',
+      setStorages: 'Other storages',
+      setProfile: 'Profile & plugins',
+      setModules: 'Installed modules',
+      setCredentials: 'Credential refs (API keys only)',
+      setAttachments: 'Attachments',
+      setCache: 'Cache (off by default)',
       copy: 'Copy',
     };
 
@@ -121,6 +130,15 @@ window.__ModuleLoader__.load({
       skipped: '跳过',
       confirmClear: '移除共享密钥？仍在使用该密钥的设备将被拒绝。',
       confirmGenerate: '替换当前共享密钥？另一台设备在设置新密钥前将无法同步。',
+      scope: '同步范围',
+      scopeHint: '每台设备用同一套规则合并文件：会话日志按 zstd 帧前缀追加，工作区/配置/凭据结构化合并，其它文件冲突时保留双方副本。',
+      setWorkspace: '工作区索引',
+      setStorages: '其它 storages 数据',
+      setProfile: '配置与插件',
+      setModules: '已安装模块',
+      setCredentials: '凭据引用（仅 API_KEY）',
+      setAttachments: '附件',
+      setCache: '缓存（默认关闭）',
       copy: '复制',
     };
 
@@ -219,6 +237,7 @@ window.__ModuleLoader__.load({
       rowBetween: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px' },
       small: { fontSize: '12px', color: 'var(--dsw-alias-label-tertiary)' },
       label: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary)' },
+      scopeGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))', gap: '6px 14px' },
       input: {
         flex: '1 1 180px',
         minWidth: '140px',
@@ -409,6 +428,12 @@ window.__ModuleLoader__.load({
           setConfig(result);
         });
 
+      const toggleSet = (id, next) =>
+        run(async () => {
+          const result = await api('/config', { method: 'POST', body: { sets: { [id]: next } } });
+          setConfig(result);
+        });
+
       const changeInterval = (event) =>
         run(async () => {
           const result = await api('/config', { method: 'POST', body: { autoSyncMs: Number(event.target.value) } });
@@ -558,6 +583,25 @@ window.__ModuleLoader__.load({
           ),
         ),
         h('div', { style: styles.small }, translate('pushHint')),
+        h('div', { style: { ...styles.label, marginTop: '12px' } }, translate('scope')),
+        h(
+          'div',
+          { style: styles.scopeGrid },
+          ['workspace', 'storages', 'profile', 'modules', 'credentials', 'attachments', 'cache'].map((id) =>
+            h(
+              'label',
+              { key: id, style: styles.checkboxRow },
+              h('input', {
+                type: 'checkbox',
+                checked: config?.sets?.[id] !== false,
+                onChange: (event) => toggleSet(id, event.target.checked),
+                disabled: busy,
+              }),
+              h('span', { style: styles.small }, translate(`set${id[0].toUpperCase()}${id.slice(1)}`)),
+            ),
+          ),
+        ),
+        h('div', { style: styles.small }, translate('scopeHint')),
         h(
           'div',
           { style: styles.row },

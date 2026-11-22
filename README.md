@@ -1,90 +1,82 @@
-# LAN session sync for DeepSeek Harness
+# LAN sync for DeepSeek Harness (flat mesh)
 
-Every DeepSeek Harness install on the same LAN is an **equal peer** in a flat
-mesh: each device pulls the sessions it is missing and pushes the sessions a
-peer is missing. A session can therefore travel directly between any two
-devices, in either direction, and through a third device as a relay when two
-devices cannot reach each other directly. Merging is by verified content; an
-existing session log is never replaced or overwritten.
+Every DeepSeek Harness install on the same network is an **equal peer** in a
+flat mesh: each device pulls the files it is missing, pushes the sessions a
+peer is missing, and merges append-only session logs byte-for-byte. A session
+can travel directly between any two devices, in either direction, and through
+a third device as a relay when two devices cannot reach each other directly.
+Nothing is coordinated by a server.
 
-## What it does
+The sync scope follows the reference design (`YarXVI/dsh-plugin-dsh-sync`):
 
-- Discovers peers automatically with UDP broadcast (and accepts manual peers).
-- Exchanges a small session catalog over plain HTTP on the LAN.
-- Pulls a missing session from a peer, imports it through the official
-  persistence service, and attaches it to a workspace.
-- Pushes sessions this device has and a peer lacks — needed when the other
-  device cannot open a connection to this one (for example asymmetric Wi-Fi
-  client isolation). Pushing is on by default and can be turned off.
-- Skips a session when its origin (`device id/session id`), its content digest,
-  or its creation time already matches one the peer holds. Imported sessions
-  carry their **root origin**, so a session relayed through B to C is not
-  bounced back to A.
-- Caps work per run: at most 3 sessions pushed per peer, newest first, and only
-  sessions below 96 MiB (compressed) are pushed automatically.
-- Attaches imported sessions to a workspace so they appear in the sidebar.
-- Never exports seeded sessions, subagent sessions, or sessions still owned by
-  a live writer.
+| Set | What | Merge rule |
+| --- | --- | --- |
+| `sessions` | `sessions/**/session.v*.jsonl.zstd` | **append-only**: remote log is a strict prefix of local → append the zstd frames; local prefix of remote → no-op; diverged → local kept, peer copy parked under `<session>/conflicts/` |
+| `workspace` | `storages/workspace.json` | structured union: workspaces by id, session lists unioned, newer `updatedAt` wins; pinned/archived flags stay local |
+| `storages` | other `storages/*` (`schedule.json`, …) | conflict-safe last-writer-wins |
+| `profile` | profile `package.json`, `cordis.patch.yml`, `cordis.yml`, `pnpm-workspace.yaml`, `plugins/` | deps added only when the local bundle/link exists; only model blocks of `cordis.patch.yml` merged; plugin sources mirrored without native binaries |
+| `modules` | profile `node_modules` real packages | conflict-safe last-writer-wins, no deletions, bounded size |
+| `credentials` | `.credentials.yaml` | only `*API_KEY` refs merged; existing local values win; records untouched |
+| `attachments` | `attachments/` | conflict-safe last-writer-wins |
+| `cache` | `cache/` | off by default |
+
+Only sessions are pushed proactively; other sets converge by both sides
+pulling. Live sessions (`ctx.sessions.get(id)` non-null) are never touched:
+writing into a log a DSH writer owns would desync its in-process handle.
+
+## Behaviour
+
+- Discovers peers with UDP broadcast on port **47829** (hello every 10 s) and
+  accepts manual peers; serves plain HTTP on TCP **47830** (next free port if
+  taken).
+- Every cycle asks each peer for a manifest (`POST /v1/manifest`), compares
+  size/mtime/SHA-256 plus the last agreed base, then pulls changed files
+  (`GET /v1/file`) or pushes missing sessions (`POST /v1/file`).
+- Both sides run the same pure rules, so they converge without a coordinator.
+- Conflicts never overwrite: the peer copy is parked next to the local file
+  (`*.conflict-<device>-<stamp>`) or under `conflicts/` for session logs.
+- Session copies made by older snapshot-based builds (same creation time, same
+  cwd, different id) are recognised and never appended to, because their
+  delivery markers name the source id.
+- At most 3 sessions are pushed per peer per run, newest first, each below
+  96 MiB compressed; other files are capped at 160 MiB.
+- Deletions of ordinary files propagate through tombstones (45 days) only for
+  sets that allow it; sessions, workspace and modules never delete.
+- Imported sessions are attached to a workspace so they appear in the sidebar.
 
 ## Requirements
 
 - DeepSeek Harness 0.2.1-rc.2 or newer (built against 0.2.2-rc.5).
 - Node.js 22+ (the bundled runtime is fine).
-- Both devices on the same LAN and able to reach each other's TCP port **47830**
-  and UDP port **47829**. If a port is taken, the next free port is used.
+- Peers reachable on TCP 47830 and UDP 47829 (or configure manual peers).
 
-## Settings
+## Settings (Settings → LAN sync)
 
-Add the plugin in **Settings → Plugins**, then open **Settings → LAN session
-sync**. There you can:
+- Device name, paused, automatic sync interval.
+- “Send my sessions too” (push) and a per-set scope grid.
+- Manual peers (`address:47830`), useful for Thunderbolt/USB link-local cables.
+- Optional shared key: stored as the DSH credential `lan-session-sync/key`, never
+  in the settings file. Without it, any LAN host can list and copy files, and
+  traffic is unencrypted HTTP, so use it on trusted networks only.
 
-- rename this device and pause automatic sync;
-- choose the automatic check interval (default 30 s);
-- run an immediate sync, add a manual peer by address and port;
-- protect the LAN endpoint with a shared key (stored as a DSH credential).
+## Safety notes
 
-Agent tools `lan_sync_status` and `lan_sync_now` expose the same operations.
+- Session appends write raw zstd frames from a peer whose SHA-256 was verified;
+  byte-prefix identity is checked before appending, and diverged logs are never
+  appended.
+- `workspace.json` and profile files are merged on disk. While DSH is running,
+  the live registry may rewrite some of these files; the next cycle re-merges.
+  Workspace session lists are also updated through the registry when sessions
+  are attached.
+- Plugin-owned state lives in `<DSH_HOME>/lan-session-sync/` and is never synced.
 
-## Security model
+## Files
 
-- The HTTP endpoint binds `0.0.0.0` but refuses non-LAN source addresses; public
-  addresses never get a response.
-- Every request except `/v1/health` must carry the plugin's protocol header.
-- This device can push sessions to peers as well as pull them, but an existing
-  session log is never overwritten. A peer that holds the shared key (or any
-  LAN host when no key is set) can offer sessions to this device through
-  `POST /v1/sessions`, which imports them as new sessions.
-- Optionally require a shared key. The key is held in the DSH credential store
-  (`lan-session-sync/key`), not in `state.json`.
-- LAN traffic is plain HTTP and **not encrypted**; session content and the shared
-  key cross the network in clear text. Use this only on a network you trust, and
-  set a key to stop other LAN hosts from listing or importing your sessions.
-- Session content is only ever sent to peers you can reach on the LAN; there is
-  no cloud relay.
+- `index.js` host plugin; `client.js` settings panel (web client).
+- `lib/` mesh engine, sets/paths, merge rules, file transfer, transport server,
+  discovery, session log merge helpers, credentials/model-config/bundle merge.
+- `test/` unit + HTTP end-to-end tests (`node --test test/*.test.js`).
+- `scripts/fake-peer.mjs` standalone peer for local experiments.
 
-## Behavior and limits
-
-- Sessions are copied as **snapshots**. A session that grows on the source after
-  it was imported is not updated later.
-- Only finished, non-seeded, top-level sessions with a recorded `cwd` are
-  offered. Subagent sessions are excluded.
-- A conversation already attached to a workspace is recognised by creation
-  time and working directory, so older builds that lost the origin marker
-  cannot multiply it into more visible copies.
-- An imported session keeps the source `cwd` when that directory exists on this
-  machine under a safe prefix (home, `/Applications`, `/Volumes`, `/tmp`);
-  otherwise it lands in `<DSH_HOME>/lan-session-sync/synced`.
-- Plugin state lives in `<DSH_HOME>/lan-session-sync/state.json`. A corrupt file
-  is renamed to `state.json.corrupt-<timestamp>` and sync starts paused.
-- The settings panel ships English and Chinese copy; other DSH UI languages see
-  the English fallback.
-
-## Troubleshooting
-
-- No peers: make sure both devices run DSH with this plugin, are on the same
-  subnet, and the firewall allows UDP 47829 and TCP 47830. Add the peer manually
-  if broadcasts are blocked.
-- A sync reports `not-private`: the peer resolved to a public address; use a
-  LAN address or a manual peer entry.
-- Check **Settings → LAN session sync → Recent imports** for the last imported
-  sessions and the last error summary.
+MIT. Design inspired by `YarXVI/dsh-plugin-dsh-sync`; see
+`THIRD_PARTY_NOTICES.md`.

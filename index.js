@@ -1,13 +1,18 @@
 import path from 'node:path';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { StateStore, LOCAL_ROOT, importsByLocalId, newSharedKey, normalizeState, resolveDshHome } from './lib/state.js';
 import { buildCatalog, withProvenance, MAX_SESSION_BYTES } from './lib/catalog.js';
 import { contentDigest, isPrivateAddress } from './lib/digest.js';
 import { importSession, DEFAULT_WORKSPACE_TITLE } from './lib/import.js';
 import { createEngine } from './lib/engine.js';
+import { createMesh } from './lib/mesh.js';
 import { createPeerServer } from './lib/server.js';
 import { Discoverer, PeerTable } from './lib/discovery.js';
-import { EXPORT_FORMAT, fetchPeerCatalog, fetchPeerSession, pushPeerSession, verifyExport } from './lib/transfer.js';
+import { EXPORT_FORMAT, fetchManifest, fetchPeerCatalog, fetchPeerSession, fetchSetFile, pushPeerSession, pushSetFile, verifyExport } from './lib/transfer.js';
+import { absFor, currentProfile, setAllowsRel, syncSets } from './lib/sets.js';
+import { MAX_BLOB_BYTES, applyRemoteFile } from './lib/filesync.js';
+import { createBundleResolver } from './lib/bundles.js';
 
 const API_PREFIX = '/lan-session-sync/api';
 const CREDENTIAL_KEY = 'lan-session-sync/key';
@@ -79,6 +84,8 @@ class LanSessionSync {
     this.peerTable = null;
     this.manualPeers = [];
     this.engine = null;
+    this.mesh = null;
+    this.sets = [];
     this.autoTimer = null;
     this.debounceTimer = null;
     this.disposers = [];
@@ -96,7 +103,7 @@ class LanSessionSync {
    * the filesystem (the in-memory report is only reachable from the UI).
    */
   async persistReport() {
-    const last = this.engine?.getLastResult?.();
+    const last = this.mesh?.getLastResult?.() ?? this.engine?.getLastResult?.();
     if (!last) return;
     try {
       await mkdir(this.rootDir, { recursive: true, mode: 0o700 });
@@ -115,16 +122,49 @@ class LanSessionSync {
     this.peerTable = new PeerTable();
     await this.loadKey();
 
+    this.sets = syncSets({
+      home: resolveDshHome(),
+      profile: currentProfile(),
+      enabled: this.state.settings.sets ?? null,
+    });
+
     this.server = createPeerServer({
       getDevice: () => this.deviceInfo(),
       listItems: () => this.catalogItems(),
       exportSession: (id) => this.exportSession(id),
       importSession: (input) => this.importPushedSession(input),
+      getManifest: (ids) => this.manifestFor(ids),
+      readSetFile: (setId, rel) => this.readSetFile(setId, rel),
+      applySetFile: (input) => this.applySetFile(input),
       getKey: () => this.sharedKey,
       log: { warn: (...args) => this.log('warn', ...args) },
     });
     this.port = await this.server.start(this.state.settings.httpPort);
 
+    this.mesh = createMesh({
+      state: this.state,
+      sets: this.sets,
+      getSets: () => this.sets,
+      selfDeviceId: this.state.deviceId,
+      ctx: this.ctx,
+      home: resolveDshHome(),
+      archiveRoot: path.join(this.rootDir, 'archive'),
+      listPeers: () => this.listPeers(),
+      fetchManifest: (peer, options) => fetchManifest(peer, { ...options, key: this.sharedKey }),
+      fetchSetFile: (peer, options) => fetchSetFile(peer, { ...options, key: this.sharedKey }),
+      pushSetFile: (peer, options) => pushSetFile(peer, { ...options, key: this.sharedKey }),
+      resolveBundle: this.resolveBundle(),
+      linkTargetExists: (spec) => this.linkTargetExists(spec),
+      onResult: () => {
+        void this.store.save().catch((error) => this.log('warn', 'could not save sync state', error));
+        void this.persistReport();
+        this.notify();
+      },
+      onSave: () => this.store.save().catch((error) => this.log('warn', 'could not save sync state', error)),
+    });
+
+    // Keep the legacy pull engine available for the JSON session endpoints used
+    // by older peers; the mesh above is the primary path.
     this.engine = createEngine({
       state: this.state,
       selfDeviceId: this.state.deviceId,
@@ -134,11 +174,7 @@ class LanSessionSync {
       importCandidate: (input) => this.importCandidate(input),
       listLocalSessions: () => this.catalogItems(),
       pushSession: (peer, item) => this.pushSession(peer, item),
-      onResult: () => {
-        void this.store.save().catch((error) => this.log('warn', 'could not save sync state', error));
-        void this.persistReport();
-        this.notify();
-      },
+      onResult: () => this.notify(),
     });
 
     this.discoverer = new Discoverer({
@@ -287,7 +323,7 @@ class LanSessionSync {
   listPeers() {
     // Manual peers come first: a user-configured address (for example a
     // Thunderbolt/USB link-local cable peer) is usually more reliable than a
-    // UDP-discovered address, and syncing it first lets the engine skip other
+    // UDP-discovered address, and syncing it first lets the mesh skip other
     // addresses for the same device.
     const peers = [];
     const seen = new Set();
@@ -304,6 +340,95 @@ class LanSessionSync {
       peers.push({ deviceId: peer.deviceId, name: peer.name, address: peer.address, port: peer.port, manual: false });
     }
     return peers;
+  }
+
+  findSet(setId) {
+    return this.sets.find((set) => set.id === setId) ?? null;
+  }
+
+  /** Manifest of a requested set list, computed from the local index. */
+  async manifestFor(ids) {
+    const wanted = Array.isArray(ids) && ids.length > 0 ? new Set(ids) : new Set(this.sets.map((set) => set.id));
+    const out = {};
+    for (const set of this.sets) {
+      if (!wanted.has(set.id)) continue;
+      await this.mesh.refreshSet(set.id);
+      const index = this.state.indexes?.[set.id] ?? {};
+      const entries = {};
+      for (const [rel, entry] of Object.entries(index)) {
+        if (rel === '__scannedAt' || !entry || typeof entry.h !== 'string') continue;
+        const item = { s: entry.s, m: entry.m, h: entry.h };
+        if (entry.meta && typeof entry.meta === 'object') item.meta = entry.meta;
+        entries[rel] = item;
+      }
+      const deletes = {};
+      for (const tomb of this.state.tombstones ?? []) {
+        if (tomb && tomb.set === set.id && typeof tomb.rel === 'string') deletes[tomb.rel] = { h: tomb.h, at: tomb.at };
+      }
+      out[set.id] = { entries, deletes };
+    }
+    return out;
+  }
+
+  /** Read one file from a set for a peer, bounded by MAX_BLOB_BYTES. */
+  async readSetFile(setId, rel) {
+    const set = this.findSet(setId);
+    if (!set) return null;
+    if (!setAllowsRel(set, rel)) return null;
+    const abs = absFor(set, rel);
+    if (!abs) return null;
+    const info = await stat(abs).catch(() => null);
+    if (!info || !info.isFile()) return null;
+    if (info.size > MAX_BLOB_BYTES) return { tooLarge: true, size: info.size };
+    const data = await readFile(abs);
+    return { data };
+  }
+
+  /** Apply a file pushed by a peer (session logs append, others conflict-safe). */
+  async applySetFile({ setId, rel, data, peerAddress }) {
+    const set = this.findSet(setId);
+    if (!set) {
+      const error = new Error('unknown sync set');
+      error.code = 'unknown-set';
+      error.statusCode = 400;
+      throw error;
+    }
+    const result = await this.mesh.applyPushed({ set, rel, data, peerAddress });
+    await this.store.save();
+    this.notify();
+    return result;
+  }
+
+  profileDir() {
+    const configured = process.env.DSH_PROFILE_DIR;
+    if (typeof configured === 'string' && configured.length > 0) return configured;
+    return path.join(resolveDshHome(), 'profiles', currentProfile());
+  }
+
+  resolveBundle() {
+    try {
+      const resolver = createBundleResolver({
+        profileDir: this.profileDir(),
+        env: process.env,
+        resourcesPath: process.resourcesPath,
+        execPath: process.execPath,
+      });
+      return (name) => Boolean(resolver(name));
+    } catch (error) {
+      this.log('warn', 'could not build a bundle resolver', error);
+      return null;
+    }
+  }
+
+  linkTargetExists(spec) {
+    try {
+      if (typeof spec !== 'string' || !/^(link|file):/.test(spec)) return false;
+      const target = spec.replace(/^(link|file):/, '');
+      const resolved = path.isAbsolute(target) ? target : path.resolve(this.profileDir(), target);
+      return existsSync(resolved);
+    } catch {
+      return false;
+    }
   }
 
   async fetchCatalog(peer) {
@@ -402,7 +527,7 @@ class LanSessionSync {
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = null;
       if (!this.state.settings.auto || this.state.paused) return;
-      void this.engine.syncNow().catch((error) => this.log('warn', 'automatic sync failed', error));
+      void this.mesh.syncNow().catch((error) => this.log('warn', 'automatic sync failed', error));
     }, NEW_PEER_DEBOUNCE_MS);
     this.debounceTimer.unref?.();
   }
@@ -415,7 +540,7 @@ class LanSessionSync {
     if (!this.state.settings.auto || this.state.paused) return;
     const interval = this.state.settings.autoSyncMs;
     this.autoTimer = setInterval(() => {
-      void this.engine.syncNow().catch((error) => this.log('warn', 'automatic sync failed', error));
+      void this.mesh.syncNow().catch((error) => this.log('warn', 'automatic sync failed', error));
     }, interval);
     this.autoTimer.unref?.();
   }
@@ -450,7 +575,9 @@ class LanSessionSync {
         manual: peer.manual === true,
       })),
       imports: Object.keys(this.state.imports ?? {}).length,
-      last: summarizeReport(this.engine?.getLastResult()),
+      last: summarizeReport(this.mesh?.getLastResult() ?? this.engine?.getLastResult()),
+      sets: this.state.settings.sets,
+      setIds: this.sets.map((set) => set.id),
     };
   }
 
@@ -461,6 +588,7 @@ class LanSessionSync {
       auto: this.state.settings.auto,
       autoSyncMs: this.state.settings.autoSyncMs,
       push: this.state.settings.push !== false,
+      sets: this.state.settings.sets,
       httpPort: this.port || this.state.settings.httpPort,
       discoveryPort: this.state.settings.discoveryPort,
       keyEnabled: Boolean(this.sharedKey),
@@ -480,7 +608,7 @@ class LanSessionSync {
       }))
       .sort((left, right) => right.importedAt - left.importedAt)
       .slice(0, 20);
-    return { imports: entries, last: summarizeReport(this.engine?.getLastResult()) };
+    return { imports: entries, last: summarizeReport(this.mesh?.getLastResult() ?? this.engine?.getLastResult()) };
   }
 
   async updateConfig(body) {
@@ -493,6 +621,12 @@ class LanSessionSync {
     if (typeof body.paused === 'boolean') draft.paused = body.paused;
     if (typeof body.auto === 'boolean') draft.settings.auto = body.auto;
     if (typeof body.push === 'boolean') draft.settings.push = body.push;
+    if (body.sets && typeof body.sets === 'object') {
+      draft.settings.sets = { ...draft.settings.sets };
+      for (const id of ['workspace', 'storages', 'profile', 'modules', 'credentials', 'attachments', 'cache']) {
+        if (typeof body.sets[id] === 'boolean') draft.settings.sets[id] = body.sets[id];
+      }
+    }
     if (body.autoSyncMs !== undefined) draft.settings.autoSyncMs = body.autoSyncMs;
     const next = normalizeState(draft);
     this.state.deviceName = next.deviceName;
@@ -500,7 +634,9 @@ class LanSessionSync {
     this.state.settings.auto = next.settings.auto;
     this.state.settings.autoSyncMs = next.settings.autoSyncMs;
     this.state.settings.push = next.settings.push;
+    if (next.settings.sets) this.state.settings.sets = { ...next.settings.sets };
     await this.store.save();
+    this.sets = syncSets({ home: resolveDshHome(), profile: currentProfile(), enabled: this.state.settings.sets });
     this.applySchedule();
     return this.configPayload();
   }
@@ -598,7 +734,7 @@ class LanSessionSync {
         sendJson(response, 409, { ok: false, error: 'paused' });
         return;
       }
-      const report = await this.engine.syncNow();
+      const report = await this.mesh.syncNow();
       if (report && report.busy) {
         sendJson(response, 202, { ok: true, busy: true });
         return;
@@ -657,7 +793,7 @@ class LanSessionSync {
     const syncTool = {
       name: 'lan_sync_now',
       description:
-        'Run one LAN session sync now: each device is an equal peer — pull sessions this machine is missing and push sessions the peer is missing. Merges by verified content; never overwrites an existing session log.',
+        'Run one LAN sync now: every device is an equal peer — pull sessions/files this machine is missing, push sessions the peer lacks, merge append-only session logs by zstd frame prefix, and park conflicts instead of overwriting.',
       parameters: { type: 'object', properties: {}, additionalProperties: false },
       output: {
         schema: { type: 'object', additionalProperties: true },
@@ -665,7 +801,7 @@ class LanSessionSync {
       },
       execute: async () => {
         if (this.state.paused) return { ok: false, error: 'paused', hint: 'Resume LAN session sync in Settings, then retry.' };
-        const report = await this.engine.syncNow();
+        const report = await this.mesh.syncNow();
         if (report && report.busy) return { ok: true, busy: true };
         return { ok: true, last: summarizeReport(report) };
       },
