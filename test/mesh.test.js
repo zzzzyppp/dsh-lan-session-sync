@@ -149,3 +149,25 @@ test('syncSets includes every reference set with cache off by default', () => {
   }
   assert.equal(ids.includes('cache'), false);
 });
+
+test('a pulled file never writes through a symlinked directory outside the set root', async () => {
+  const root = await tempRoot();
+  const outside = await tempRoot();
+  try {
+    const { symlink } = await import('node:fs/promises');
+    await symlink(outside, join(root, 'link'));
+    const set = { id: 'sessions', root, mode: 'append', include: null, exclude: null, deletesEnabled: false };
+    const result = await applyRemoteFile({
+      set,
+      rel: 'link/session.v4.jsonl.zstd',
+      data: Buffer.from('REMOTE'),
+      entry: { h: null, s: 6, m: Date.now() },
+      peer: 'peer-a',
+    });
+    assert.equal(result.applied, 'skipped');
+    assert.equal(result.reason, 'symlink-escape');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
