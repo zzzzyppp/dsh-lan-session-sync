@@ -123,3 +123,37 @@ test('mesh pushes a session the peer lacks instead of only waiting for pulls', a
     await rm(rootB, { recursive: true, force: true });
   }
 });
+
+test('a diverged session is parked once and later runs skip it', async () => {
+  const rootA = await mkdtemp(join(tmpdir(), 'mesh-conf-a-'));
+  const rootB = await mkdtemp(join(tmpdir(), 'mesh-conf-b-'));
+  try {
+    const dir = 'session-conf';
+    const rel = `${dir}/session.v4.jsonl.zstd`;
+    await mkdir(join(rootA, dir), { recursive: true });
+    await mkdir(join(rootB, dir), { recursive: true });
+    await writeFile(join(rootA, rel), Buffer.from('REMOTE-LOG'));
+    await writeFile(join(rootB, rel), Buffer.from('LOCAL-LOG'));
+    const a = await makeNode('device-a', rootA);
+    const b = await makeNode('device-b', rootB);
+    try {
+      const meshB = makeMesh(b, [{ deviceId: null, name: 'a', address: '127.0.0.1', port: a.port }]);
+      const first = await meshB.syncNow();
+      assert.equal(first.errors.length, 0, JSON.stringify(first.errors));
+      assert.equal(first.conflicts, 1);
+      const { readdir } = await import('node:fs/promises');
+      const conflicts1 = await readdir(join(rootB, dir, 'conflicts'));
+      const second = await meshB.syncNow();
+      assert.equal(second.conflicts, 0, JSON.stringify(second));
+      const conflicts2 = await readdir(join(rootB, dir, 'conflicts'));
+      assert.equal(conflicts2.length, conflicts1.length);
+      assert.deepEqual(await readFile(join(rootB, rel)), Buffer.from('LOCAL-LOG'));
+    } finally {
+      await a.server.close();
+      await b.server.close();
+    }
+  } finally {
+    await rm(rootA, { recursive: true, force: true });
+    await rm(rootB, { recursive: true, force: true });
+  }
+});
