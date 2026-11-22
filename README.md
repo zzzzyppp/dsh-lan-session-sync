@@ -44,6 +44,21 @@ writing into a log a DSH writer owns would desync its in-process handle.
   sets that allow it; sessions, workspace and modules never delete.
 - Imported sessions are attached to a workspace so they appear in the sidebar.
 
+
+## Legacy copies and conflicts
+
+Sessions imported by the 1.x snapshot builds keep their conversation under a
+different local id than the peer's growing log. Those pairs are detected by
+`createdAt`+`cwd` and **skipped** (`alias-mismatch`): appending the peer's bytes
+to them would corrupt their delivery markers, and importing the peer log again
+would duplicate the conversation. They stay readable but do not receive new
+turns from the peer.
+
+A session log that exists on both sides with the same id but diverged content is
+parked once under `<session>/conflicts/` and then left alone (`conflict-parked`)
+until the local file changes, so a live peer never creates a new copy every
+cycle.
+
 ## Requirements
 
 - DeepSeek Harness 0.2.1-rc.2 or newer (built against 0.2.2-rc.5).
