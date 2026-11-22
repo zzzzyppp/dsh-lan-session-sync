@@ -1,6 +1,6 @@
 {
   "name": "dsh-lan-session-sync",
-  "version": "1.0.0",
+  "version": "1.1.1",
   "private": true,
   "type": "module",
   "description": "Peer-to-peer LAN session sync for DeepSeek Harness: each machine keeps its own sessions and only imports sessions it does not already have.",

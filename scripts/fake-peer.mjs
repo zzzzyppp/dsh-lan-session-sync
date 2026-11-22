@@ -8,9 +8,11 @@
  *   node scripts/fake-peer.mjs [--port 48930] [--discovery-port 47829]
  *                              [--name "Fake peer"] [--device-id fake-peer-001]
  *                              [--key <shared key>] [--no-broadcast]
+ *                              [--empty] [--push-log <path>]
  */
 import { createHash, randomUUID } from 'node:crypto';
 import dgram from 'node:dgram';
+import { appendFileSync } from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 
@@ -28,6 +30,8 @@ function parseArgs(argv) {
     deviceId: 'fake-peer-001',
     key: '',
     broadcast: true,
+    empty: false,
+    pushLog: '',
   };
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
@@ -37,6 +41,8 @@ function parseArgs(argv) {
     else if (value === '--device-id') args.deviceId = argv[++index];
     else if (value === '--key') args.key = argv[++index] ?? '';
     else if (value === '--no-broadcast') args.broadcast = false;
+    else if (value === '--empty') args.empty = true;
+    else if (value === '--push-log') args.pushLog = argv[++index] ?? '';
   }
   return args;
 }
@@ -94,9 +100,44 @@ function makeSession(index, cwd) {
 }
 
 const sessions = new Map();
-for (let index = 1; index <= 2; index += 1) {
-  const session = makeSession(index, os.homedir());
-  sessions.set(session.header.id, session);
+if (!args.empty) {
+  for (let index = 1; index <= 2; index += 1) {
+    const session = makeSession(index, os.homedir());
+    sessions.set(session.header.id, session);
+  }
+}
+const receivedDigests = new Map();
+
+function readJsonBody(request) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    request.on('data', (chunk) => chunks.push(chunk));
+    request.on('end', () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+      } catch (error) {
+        reject(error);
+      }
+    });
+    request.on('error', reject);
+  });
+}
+
+function recordPush(body, events) {
+  const entry = {
+    at: new Date().toISOString(),
+    from: body?.from ?? null,
+    provenance: body?.provenance ?? null,
+    sourceSessionId: body?.sourceSessionId ?? null,
+    header: body?.header ?? null,
+    digest: digest(events),
+    events: events.length,
+  };
+  if (args.pushLog) {
+    appendFileSync(args.pushLog, `${JSON.stringify(entry)}\n`);
+  }
+  console.log(`[fake-peer] push from=${entry.from?.deviceId ?? '?'} provenance=${entry.provenance?.deviceId ?? '-'} session=${entry.sourceSessionId ?? '?'} events=${entry.events}`);
+  return entry;
 }
 
 function catalog() {
@@ -109,6 +150,7 @@ function catalog() {
       eventCount: session.events.length,
       sizeBytes: Buffer.byteLength(JSON.stringify(session.events)),
       updatedAt: session.header.createdAt,
+      ...(session.importedFrom ? { importedFrom: session.importedFrom } : {}),
     }))
     .sort((left, right) => right.createdAt - left.createdAt);
 }
@@ -147,13 +189,43 @@ const server = http.createServer((request, response) => {
     });
     return;
   }
-  if (url.pathname === '/v1/sessions') {
+  if (url.pathname === '/v1/sessions' && request.method === 'GET') {
     sendJson(response, 200, {
       ok: true,
       protocol: PROTOCOL,
       peer: { deviceId: args.deviceId, name: args.name },
       items: catalog(),
     });
+    return;
+  }
+  if (url.pathname === '/v1/sessions' && request.method === 'POST') {
+    readJsonBody(request)
+      .then((body) => {
+        const events = body?.events ?? body?.session?.events;
+        const header = body?.header ?? body?.session?.header;
+        if (!Array.isArray(events) || !header || typeof header.id !== 'string') {
+          sendJson(response, 400, { ok: false, error: 'bad-session' });
+          return;
+        }
+        if (body?.digest && body.digest !== digest(events)) {
+          sendJson(response, 409, { ok: false, error: 'digest-mismatch' });
+          return;
+        }
+        recordPush(body, events);
+        const contentKey = digest(events);
+        if (receivedDigests.has(contentKey) || sessions.has(header.id)) {
+          sendJson(response, 200, { ok: true, imported: false, result: { imported: false, reason: 'already-present' } });
+          return;
+        }
+        const localId = `session-fake-rx-${randomUUID().slice(0, 8)}`;
+        const importedFrom = body?.from && typeof body.from.deviceId === 'string' && typeof body?.sourceSessionId === 'string'
+          ? { deviceId: body.from.deviceId, sessionId: body.sourceSessionId }
+          : null;
+        sessions.set(localId, { header: { ...header, id: localId }, events, importedFrom });
+        receivedDigests.set(contentKey, localId);
+        sendJson(response, 200, { ok: true, imported: true, result: { imported: true, localId } });
+      })
+      .catch(() => sendJson(response, 400, { ok: false, error: 'bad-json' }));
     return;
   }
   const match = /^\/v1\/sessions\/([^/]+)$/.exec(url.pathname);

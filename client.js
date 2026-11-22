@@ -8,7 +8,7 @@ window.__ModuleLoader__.load({
     const en = {
       title: 'LAN session sync',
       description:
-        'Pull sessions from other DeepSeek Harness instances on your LAN. Sessions are copied one way, only when this machine does not already have them; this device never pushes or overwrites. Set a shared key before using this on a network you do not fully trust.',
+        'Sync sessions with other DeepSeek Harness instances on your LAN. Every device is an equal peer: this device imports sessions it is missing and sends sessions a peer is missing, so a session can travel through any chain of devices. Merges by verified content and never overwrites an existing log. Set a shared key before using this on a network you do not fully trust.',
       device: 'This device',
       deviceName: 'Device name',
       deviceId: 'Device id',
@@ -19,11 +19,14 @@ window.__ModuleLoader__.load({
       paused: 'Paused',
       pauseHint: 'Pausing stops automatic checks. Manual sync is disabled while paused.',
       auto: 'Automatic sync',
-      autoHint: 'Checks LAN peers in the background and imports missing sessions.',
+      autoHint: 'Checks LAN peers in the background, imports missing sessions and sends missing ones.',
+      push: 'Send my sessions too',
+      pushHint: 'Push sessions this device has and a peer is missing. Needed when the other device cannot reach this one directly.',
       interval: 'Check every',
       seconds: 'seconds',
       minutes: 'min',
       importedCount: 'imported',
+      pushedCount: 'sent',
       syncNow: 'Sync now',
       syncing: 'Syncing…',
       lastSync: 'Last sync',
@@ -65,7 +68,7 @@ window.__ModuleLoader__.load({
     const zh = {
       title: '局域网会话同步',
       description:
-        '从同一局域网内的其他 DeepSeek Harness 拉取会话。只做单向复制，且仅当本机还没有该会话时才导入；本机不会推送或覆盖。若不完全信任所在网络，请先设置共享密钥。',
+        '与同一局域网内的其他 DeepSeek Harness 双向同步会话。所有设备都是平级节点：本机导入缺失的会话，同时把对方缺少的会话推送过去，因此会话可以经由任一设备中转。按校验内容合并，不覆盖已有日志。若不完全信任所在网络，请先设置共享密钥。',
       device: '本机',
       deviceName: '设备名称',
       deviceId: '设备 ID',
@@ -76,11 +79,14 @@ window.__ModuleLoader__.load({
       paused: '已暂停',
       pauseHint: '暂停后不再自动检查，手动同步也会被禁用。',
       auto: '自动同步',
-      autoHint: '后台定期检查局域网设备并导入缺失的会话。',
+      autoHint: '后台定期检查局域网设备，导入缺失的会话并把对方缺少的会话推送过去。',
+      push: '同时推送本机会话',
+      pushHint: '把本机已有、对方缺少的会话推送过去；当对方无法直接访问本机时需要它。',
       interval: '检查间隔',
       seconds: '秒',
       minutes: '分钟',
-      importedCount: '个会话',
+      importedCount: '个导入',
+      pushedCount: '个发出',
       syncNow: '立即同步',
       syncing: '同步中…',
       lastSync: '上次同步',
@@ -397,6 +403,12 @@ window.__ModuleLoader__.load({
           setConfig(result);
         });
 
+      const togglePush = (next) =>
+        run(async () => {
+          const result = await api('/config', { method: 'POST', body: { push: next } });
+          setConfig(result);
+        });
+
       const changeInterval = (event) =>
         run(async () => {
           const result = await api('/config', { method: 'POST', body: { autoSyncMs: Number(event.target.value) } });
@@ -537,6 +549,17 @@ window.__ModuleLoader__.load({
         h('div', { style: styles.small }, translate('autoHint')),
         h(
           'div',
+          { style: styles.rowBetween },
+          h(
+            'label',
+            { style: styles.checkboxRow },
+            h('input', { type: 'checkbox', checked: config?.push !== false, onChange: (event) => togglePush(event.target.checked) }),
+            h('span', null, translate('push')),
+          ),
+        ),
+        h('div', { style: styles.small }, translate('pushHint')),
+        h(
+          'div',
           { style: styles.row },
           h('span', { style: styles.label }, translate('interval')),
           h(
@@ -551,7 +574,7 @@ window.__ModuleLoader__.load({
             { style: styles.small },
             `${translate('lastSync')}: ${
               last
-                ? `${formatTime(translate, last.finishedAt, localeTag)} · ${last.peers} ${translate('checkedPeers')} · ${last.imported} ${translate('importedCount')} · ${translate('skipped')} ${last.skipped}`
+                ? `${formatTime(translate, last.finishedAt, localeTag)} · ${last.peers} ${translate('checkedPeers')} · ${last.imported} ${translate('importedCount')} · ${last.pushed ?? 0} ${translate('pushedCount')} · ${translate('skipped')} ${last.skipped}`
                 : translate('never')
             }`,
           ),

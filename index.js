@@ -7,7 +7,7 @@ import { importSession, DEFAULT_WORKSPACE_TITLE } from './lib/import.js';
 import { createEngine } from './lib/engine.js';
 import { createPeerServer } from './lib/server.js';
 import { Discoverer, PeerTable } from './lib/discovery.js';
-import { fetchPeerCatalog, fetchPeerSession, verifyExport } from './lib/transfer.js';
+import { EXPORT_FORMAT, fetchPeerCatalog, fetchPeerSession, pushPeerSession, verifyExport } from './lib/transfer.js';
 
 const API_PREFIX = '/lan-session-sync/api';
 const CREDENTIAL_KEY = 'lan-session-sync/key';
@@ -57,6 +57,8 @@ function summarizeReport(report) {
     peers: Array.isArray(report.peers) ? report.peers.length : 0,
     imported: report.imported ?? 0,
     importedIds: Array.isArray(report.importedIds) ? report.importedIds.slice(0, 20) : [],
+    pushed: report.pushed ?? 0,
+    pushedIds: Array.isArray(report.pushedIds) ? report.pushedIds.slice(0, 20) : [],
     skipped: Array.isArray(report.skipped) ? report.skipped.length : 0,
     errors: Array.isArray(report.errors) ? report.errors.slice(0, 10) : [],
   };
@@ -130,6 +132,8 @@ class LanSessionSync {
       fetchCatalog: (peer) => this.fetchCatalog(peer),
       fetchSession: (peer, item) => fetchPeerSession(peer, item.id, { key: this.sharedKey }),
       importCandidate: (input) => this.importCandidate(input),
+      listLocalSessions: () => this.catalogItems(),
+      pushSession: (peer, item) => this.pushSession(peer, item),
       onResult: () => {
         void this.store.save().catch((error) => this.log('warn', 'could not save sync state', error));
         void this.persistReport();
@@ -255,6 +259,31 @@ class LanSessionSync {
     }
   }
 
+  /**
+   * Send one local session to a peer. The receiver merges by verified content,
+   * so a peer that already has it simply answers imported:false.
+   */
+  async pushSession(peer, item) {
+    const exported = await this.exportSession(item.id);
+    if (!exported) return { pushed: false, reason: 'missing' };
+    if (exported.tooLarge) return { pushed: false, reason: 'too-large' };
+    const provenance = item.importedFrom
+      && typeof item.importedFrom.deviceId === 'string'
+      && typeof item.importedFrom.sessionId === 'string'
+      ? { deviceId: item.importedFrom.deviceId, sessionId: item.importedFrom.sessionId }
+      : null;
+    const response = await pushPeerSession(peer, {
+      format: EXPORT_FORMAT,
+      digest: exported.digest,
+      header: exported.header,
+      events: exported.events,
+      sourceSessionId: item.id,
+      from: { deviceId: this.state.deviceId, name: this.state.deviceName, platform: process.platform },
+      provenance,
+    }, { key: this.sharedKey });
+    return { pushed: true, imported: response?.result?.imported === true };
+  }
+
   listPeers() {
     // Manual peers come first: a user-configured address (for example a
     // Thunderbolt/USB link-local cable peer) is usually more reliable than a
@@ -325,8 +354,27 @@ class LanSessionSync {
   async importPushedSession(input) {
     const header = input?.header;
     const events = input?.events;
-    const sourceDeviceId = typeof input?.peerAddress === 'string' && input.peerAddress.length > 0 ? `push:${input.peerAddress}` : 'push:unknown';
-    const sourceSessionId = header && typeof header.id === 'string' && header.id.length > 0 ? header.id : 'unknown';
+    const senderId = input?.from
+      && typeof input.from.deviceId === 'string'
+      && input.from.deviceId.length > 0
+      && input.from.deviceId.length <= 128
+      ? input.from.deviceId
+      : null;
+    if (senderId && senderId === this.state.deviceId) {
+      // A push that claims to come from this very device: never import our own
+      // sessions back onto ourselves.
+      return { imported: false, reason: 'self' };
+    }
+    const sourceDeviceId = senderId
+      ?? (typeof input?.peerAddress === 'string' && input.peerAddress.length > 0 ? `push:${input.peerAddress}` : 'push:unknown');
+    const sourceSessionId = typeof input?.sourceSessionId === 'string' && input.sourceSessionId.length > 0
+      ? input.sourceSessionId
+      : (header && typeof header.id === 'string' && header.id.length > 0 ? header.id : 'unknown');
+    const provenance = input?.provenance
+      && typeof input.provenance.deviceId === 'string'
+      && typeof input.provenance.sessionId === 'string'
+      ? { deviceId: input.provenance.deviceId.slice(0, 128), sessionId: input.provenance.sessionId.slice(0, 200) }
+      : null;
     const result = await importSession({
       sourceDeviceId,
       sourceSessionId,
@@ -338,6 +386,7 @@ class LanSessionSync {
       sessions: this.ctx.sessions,
       state: this.state,
       landingDir: this.landingDir,
+      provenance,
       selfDeviceId: this.state.deviceId,
     });
     if (result.imported) await this.store.save();
@@ -389,6 +438,7 @@ class LanSessionSync {
         auto: this.state.settings.auto,
         autoSyncMs: this.state.settings.autoSyncMs,
         paused: this.state.paused,
+        push: this.state.settings.push !== false,
         keyEnabled: Boolean(this.sharedKey),
         error: this.error ? String(this.error.message ?? this.error) : null,
       },
@@ -410,6 +460,7 @@ class LanSessionSync {
       paused: this.state.paused,
       auto: this.state.settings.auto,
       autoSyncMs: this.state.settings.autoSyncMs,
+      push: this.state.settings.push !== false,
       httpPort: this.port || this.state.settings.httpPort,
       discoveryPort: this.state.settings.discoveryPort,
       keyEnabled: Boolean(this.sharedKey),
@@ -441,12 +492,14 @@ class LanSessionSync {
     }
     if (typeof body.paused === 'boolean') draft.paused = body.paused;
     if (typeof body.auto === 'boolean') draft.settings.auto = body.auto;
+    if (typeof body.push === 'boolean') draft.settings.push = body.push;
     if (body.autoSyncMs !== undefined) draft.settings.autoSyncMs = body.autoSyncMs;
     const next = normalizeState(draft);
     this.state.deviceName = next.deviceName;
     this.state.paused = next.paused;
     this.state.settings.auto = next.settings.auto;
     this.state.settings.autoSyncMs = next.settings.autoSyncMs;
+    this.state.settings.push = next.settings.push;
     await this.store.save();
     this.applySchedule();
     return this.configPayload();
@@ -604,7 +657,7 @@ class LanSessionSync {
     const syncTool = {
       name: 'lan_sync_now',
       description:
-        'Run one pull-only LAN session sync now: fetch sessions from discovered LAN peers and import only sessions this machine does not already have. Never pushes or overwrites.',
+        'Run one LAN session sync now: each device is an equal peer — pull sessions this machine is missing and push sessions the peer is missing. Merges by verified content; never overwrites an existing session log.',
       parameters: { type: 'object', properties: {}, additionalProperties: false },
       output: {
         schema: { type: 'object', additionalProperties: true },

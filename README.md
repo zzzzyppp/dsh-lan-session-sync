@@ -1,18 +1,27 @@
 # LAN session sync for DeepSeek Harness
 
-Two DeepSeek Harness installs on the same LAN keep their own sessions and copy
-across only what the other machine is missing. Sync is **pull-only**: a device
-lists the sessions offered by its peers and imports the ones it does not
-already have. This device only pulls; it never pushes, replaces, or overwrites.
+Every DeepSeek Harness install on the same LAN is an **equal peer** in a flat
+mesh: each device pulls the sessions it is missing and pushes the sessions a
+peer is missing. A session can therefore travel directly between any two
+devices, in either direction, and through a third device as a relay when two
+devices cannot reach each other directly. Merging is by verified content; an
+existing session log is never replaced or overwritten.
 
 ## What it does
 
 - Discovers peers automatically with UDP broadcast (and accepts manual peers).
 - Exchanges a small session catalog over plain HTTP on the LAN.
-- Imports a missing session through the official persistence service, as a new
-  local session with a deterministic id derived from its content.
-- Skips a session when its origin (`device id/session id`) or its content digest
-  is already known, so peers cannot bounce the same session back and forth.
+- Pulls a missing session from a peer, imports it through the official
+  persistence service, and attaches it to a workspace.
+- Pushes sessions this device has and a peer lacks — needed when the other
+  device cannot open a connection to this one (for example asymmetric Wi-Fi
+  client isolation). Pushing is on by default and can be turned off.
+- Skips a session when its origin (`device id/session id`), its content digest,
+  or its creation time already matches one the peer holds. Imported sessions
+  carry their **root origin**, so a session relayed through B to C is not
+  bounced back to A.
+- Caps work per run: at most 3 sessions pushed per peer, newest first, and only
+  sessions below 96 MiB (compressed) are pushed automatically.
 - Attaches imported sessions to a workspace so they appear in the sidebar.
 - Never exports seeded sessions, subagent sessions, or sessions still owned by
   a live writer.
@@ -41,9 +50,10 @@ Agent tools `lan_sync_status` and `lan_sync_now` expose the same operations.
 - The HTTP endpoint binds `0.0.0.0` but refuses non-LAN source addresses; public
   addresses never get a response.
 - Every request except `/v1/health` must carry the plugin's protocol header.
-- This device only pulls; it never pushes or overwrites. A peer that holds the
-  shared key (or any LAN host when no key is set) can offer sessions to this
-  device through `POST /v1/sessions`, which imports them as new sessions.
+- This device can push sessions to peers as well as pull them, but an existing
+  session log is never overwritten. A peer that holds the shared key (or any
+  LAN host when no key is set) can offer sessions to this device through
+  `POST /v1/sessions`, which imports them as new sessions.
 - Optionally require a shared key. The key is held in the DSH credential store
   (`lan-session-sync/key`), not in `state.json`.
 - LAN traffic is plain HTTP and **not encrypted**; session content and the shared
@@ -58,6 +68,9 @@ Agent tools `lan_sync_status` and `lan_sync_now` expose the same operations.
   it was imported is not updated later.
 - Only finished, non-seeded, top-level sessions with a recorded `cwd` are
   offered. Subagent sessions are excluded.
+- A conversation already attached to a workspace is recognised by creation
+  time and working directory, so older builds that lost the origin marker
+  cannot multiply it into more visible copies.
 - An imported session keeps the source `cwd` when that directory exists on this
   machine under a safe prefix (home, `/Applications`, `/Volumes`, `/tmp`);
   otherwise it lands in `<DSH_HOME>/lan-session-sync/synced`.

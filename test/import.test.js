@@ -351,3 +351,24 @@ test('importSession aliases a same-id local log that is already visible', async 
   assert.equal(result.reason, 'already-local');
   assert.equal(calls.created.length, 0);
 });
+
+test('importSession aliases an attached session with the same creation time', async () => {
+  const { calls, persistence, sessions, workspaceRegistry } = fakes();
+  const existingId = 'session-local-copy';
+  persistence.list = async () => [
+    { header: { version: 4, id: existingId, createdAt: HEADER.createdAt, cwd: HEADER.cwd } },
+  ];
+  workspaceRegistry.list = () => [{ sessionIds: [existingId] }];
+  const cwd = await landing();
+  const options = baseOptions({ persistence, sessions, workspaceRegistry, landingDir: cwd, now: 999 });
+
+  const result = await importSession(options);
+
+  assert.equal(result.imported, false);
+  assert.equal(result.reason, 'duplicate-created-at');
+  assert.equal(result.localId, existingId);
+  assert.equal(calls.created.length, 0);
+  const record = options.state.imports[originKey('device-b', 'session-remote')];
+  assert.equal(record.alias, true);
+  assert.equal(record.localId, existingId);
+});
