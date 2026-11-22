@@ -171,3 +171,21 @@ test('a pulled file never writes through a symlinked directory outside the set r
     await rm(outside, { recursive: true, force: true });
   }
 });
+
+test('the same diverged payload is parked only once', async () => {
+  const root = await tempRoot();
+  try {
+    const dir = join(root, 'session-x');
+    await mkdir(dir, { recursive: true });
+    const file = join(dir, 'session.v4.jsonl.zstd');
+    await writeFile(file, Buffer.from('LOCAL'));
+    const first = await applySessionBytes({ absPath: file, data: Buffer.from('REMOTE'), peerId: 'peer-a' });
+    const second = await applySessionBytes({ absPath: file, data: Buffer.from('REMOTE'), peerId: 'peer-b' });
+    assert.equal(second.applied, 'conflict');
+    assert.equal(second.conflictFile, first.conflictFile);
+    const { readdir } = await import('node:fs/promises');
+    assert.equal((await readdir(join(dir, 'conflicts'))).length, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
